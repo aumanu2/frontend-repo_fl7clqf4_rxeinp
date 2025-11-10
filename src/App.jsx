@@ -26,6 +26,16 @@ function Button({ children, onClick, className = '', ...props }) {
 
 const baseUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
+function prettyTime(iso) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  const diff = (Date.now() - d.getTime()) / 1000
+  if (diff < 60) return 'ora'
+  if (diff < 3600) return `${Math.floor(diff/60)} min fa`
+  if (diff < 86400) return `${Math.floor(diff/3600)} h fa`
+  return d.toLocaleDateString()
+}
+
 function App() {
   const [me, setMe] = useState('')
   const [displayName, setDisplayName] = useState('')
@@ -37,7 +47,11 @@ function App() {
   const [selectedChat, setSelectedChat] = useState(null)
   const [messages, setMessages] = useState([])
   const [compose, setCompose] = useState('')
+  const [search, setSearch] = useState('')
+  const [users, setUsers] = useState([])
+  const [profiles, setProfiles] = useState({})
   const pollRef = useRef(null)
+  const wsRef = useRef(null)
 
   useEffect(() => {
     const saved = localStorage.getItem('vibechat_username')
@@ -54,7 +68,9 @@ function App() {
   useEffect(() => {
     if (stage === 'chat' && me) {
       refreshChats()
+      connectWS()
     }
+    return () => disconnectWS()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stage, me])
 
@@ -62,11 +78,11 @@ function App() {
     if (!selectedChat) return
     fetchMessages(selectedChat._id)
 
-    // start polling
+    // start polling as fallback
     stopPolling()
     pollRef.current = setInterval(() => {
       fetchMessages(selectedChat._id, true)
-    }, 2000)
+    }, 5000)
 
     return stopPolling
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -77,6 +93,33 @@ function App() {
       clearInterval(pollRef.current)
       pollRef.current = null
     }
+  }
+
+  const connectWS = () => {
+    try {
+      const url = (baseUrl.replace('http', 'ws') + '/ws').replace('///', '//')
+      const ws = new WebSocket(url)
+      ws.onopen = () => { ws.send('hi') }
+      ws.onmessage = (ev) => {
+        try {
+          const evt = JSON.parse(ev.data)
+          if (evt.type === 'new_message' && selectedChat && evt.chat_id === selectedChat._id) {
+            fetchMessages(selectedChat._id, true)
+            refreshChats()
+          } else {
+            refreshChats()
+          }
+        } catch {}
+      }
+      ws.onclose = () => {}
+      ws.onerror = () => {}
+      wsRef.current = ws
+    } catch {}
+  }
+
+  const disconnectWS = () => {
+    try { wsRef.current && wsRef.current.close() } catch {}
+    wsRef.current = null
   }
 
   const signIn = async () => {
@@ -118,6 +161,15 @@ function App() {
       const res = await fetch(`${baseUrl}/api/chats?username=${encodeURIComponent(me)}`)
       const data = await res.json()
       setChats(data)
+      // fetch participant profiles
+      const allIds = [...new Set(data.flatMap(c => c.participants))]
+      if (allIds.length) {
+        const r2 = await fetch(`${baseUrl}/api/users/by_ids?ids=${allIds.join(',')}`)
+        const users = await r2.json()
+        const map = {}
+        users.forEach(u => { map[u._id] = u })
+        setProfiles(map)
+      }
     } catch (e) {
       console.error(e)
     }
@@ -142,6 +194,7 @@ function App() {
       chat_id: selectedChat._id,
       sender_username: me,
       content: compose.trim(),
+      kind: 'text'
     }
     setCompose('')
     await fetch(`${baseUrl}/api/messages`, {
@@ -149,6 +202,18 @@ function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     })
+    await fetchMessages(selectedChat._id, true)
+    await refreshChats()
+  }
+
+  const uploadMedia = async (file, kind) => {
+    if (!file || !selectedChat) return
+    const form = new FormData()
+    form.append('chat_id', selectedChat._id)
+    form.append('sender_username', me)
+    form.append('kind', kind)
+    form.append('file', file)
+    await fetch(`${baseUrl}/api/messages/upload`, { method: 'POST', body: form })
     await fetchMessages(selectedChat._id, true)
     await refreshChats()
   }
@@ -177,37 +242,28 @@ function App() {
 
   const chatTitle = (chat) => {
     if (!chat || !chat.participants) return 'Chat'
-    // participants are user ids; we can't resolve names without more endpoints
-    // show the other participant count
-    const count = chat.participants.length
-    return count === 2 ? 'Chat privata' : `Gruppo (${count})`
+    const others = chat.participants.filter(pid => profiles[pid]?.username !== me)
+    if (others.length === 1) {
+      const p = profiles[others[0]]
+      if (!p) return 'Chat privata'
+      return `${p.display_name || p.username} ${p.online ? '• Online' : '• ' + (p.last_seen ? prettyTime(p.last_seen) : 'Offline')}`
+    }
+    return `Gruppo (${chat.participants.length})`
   }
 
-  if (stage === 'loading') {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50">
-        <div className="animate-pulse text-slate-600">Caricamento…</div>
-      </div>
-    )
+  const filteredUsers = async (q) => {
+    if (!q) { setUsers([]); return }
+    const r = await fetch(`${baseUrl}/api/users?q=${encodeURIComponent(q)}`)
+    const u = await r.json()
+    setUsers(u)
   }
 
-  if (stage === 'auth') {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-emerald-50 to-sky-50 flex items-center justify-center p-6">
-        <div className="bg-white w-full max-w-md rounded-2xl shadow-xl p-8">
-          <h1 className="text-3xl font-bold text-slate-800 mb-2">Vibe Chat</h1>
-          <p className="text-slate-600 mb-6">Accedi con un username per iniziare a chattare.</p>
-          {error && <div className="mb-4 text-red-600 text-sm">{error}</div>}
-          <div className="space-y-4">
-            <Input value={me} onChange={setMe} placeholder="Username" />
-            <Input value={displayName} onChange={setDisplayName} placeholder="Nome visibile" />
-            <Button onClick={signIn} disabled={loading} className="w-full">{loading ? 'Entrando…' : 'Entra'}</Button>
-          </div>
-          <div className="text-xs text-slate-500 mt-6">Backend: {baseUrl}</div>
-        </div>
-      </div>
-    )
-  }
+  const currentPartner = useMemo(() => {
+    if (!selectedChat) return null
+    const otherIds = selectedChat.participants.filter(pid => profiles[pid]?.username !== me)
+    if (otherIds.length === 1) return profiles[otherIds[0]]
+    return null
+  }, [selectedChat, profiles, me])
 
   return (
     <div className="h-screen w-full bg-slate-100 flex">
@@ -228,6 +284,20 @@ function App() {
             <Button onClick={createChat}>Crea</Button>
           </div>
           <div className="text-xs text-slate-400">Suggerimento: l'altro utente deve esistere (effettua l'accesso almeno una volta).</div>
+        </div>
+
+        <div className="p-3 border-b border-slate-200">
+          <Input value={search} onChange={(v)=>{ setSearch(v); filteredUsers(v) }} placeholder="Cerca utenti" />
+          {users.length>0 && (
+            <div className="mt-2 max-h-40 overflow-y-auto divide-y border rounded">
+              {users.map(u => (
+                <button key={u._id} onClick={() => { setNewChatUser(u.username); setUsers([]); setSearch(u.username) }} className="w-full text-left p-2 hover:bg-slate-50">
+                  <div className="font-medium">{u.display_name || u.username}</div>
+                  <div className="text-xs text-slate-500">@{u.username} {u.online ? '• Online' : '• ' + (u.last_seen ? prettyTime(u.last_seen) : 'Offline')}</div>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="overflow-y-auto flex-1">
@@ -256,26 +326,40 @@ function App() {
           <div className="flex flex-col h-full">
             <div className="p-4 bg-white border-b border-slate-200">
               <div className="font-semibold text-slate-800">{chatTitle(selectedChat)}</div>
+              {currentPartner && (
+                <div className="text-xs text-slate-500">Stato: {currentPartner.online ? 'Online' : `Ultimo accesso: ${prettyTime(currentPartner.last_seen)}`}</div>
+              )}
               <div className="text-xs text-slate-500">ID: {selectedChat._id}</div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-2 bg-slate-50">
-              {messages.map((m) => (
-                <div key={m._id} className={`max-w-[70%] rounded-2xl px-4 py-2 shadow-sm ${m.sender_id && m.sender_id.includes('')}`}></div>
-              ))}
               {messages.map((m) => {
-                const mine = m.sender_id && m.sender_id.includes('') // placeholder, we'll check by username via a trick below
+                const mine = profiles[m.sender_id]?.username === me
                 return (
                   <div key={m._id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`max-w-[70%] px-4 py-2 rounded-2xl shadow-sm ${mine ? 'bg-blue-600 text-white rounded-br-sm' : 'bg-white text-slate-800 rounded-bl-sm'}`}>
-                      <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                    <div className={`max-w-[75%] px-4 py-2 rounded-2xl shadow-sm ${mine ? 'bg-blue-600 text-white rounded-br-sm' : 'bg-white text-slate-800 rounded-bl-sm'}`}>
+                      {m.kind === 'image' && m.media_url ? (
+                        <img src={`${baseUrl}${m.media_url}`} alt="immagine" className="rounded-lg max-w-full" />
+                      ) : m.kind === 'audio' && m.media_url ? (
+                        <audio controls src={`${baseUrl}${m.media_url}`}></audio>
+                      ) : (
+                        <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                      )}
                     </div>
                   </div>
                 )
               })}
             </div>
 
-            <div className="p-4 bg-white border-t border-slate-200 flex gap-2">
+            <div className="p-4 bg-white border-t border-slate-200 flex gap-2 items-center">
+              <label className="text-sm px-3 py-2 border rounded cursor-pointer bg-slate-50 hover:bg-slate-100">
+                📷
+                <input type="file" accept="image/*" className="hidden" onChange={(e)=>{ const f=e.target.files?.[0]; if(f) uploadMedia(f, 'image'); e.target.value='' }} />
+              </label>
+              <label className="text-sm px-3 py-2 border rounded cursor-pointer bg-slate-50 hover:bg-slate-100">
+                🎙️
+                <input type="file" accept="audio/*" className="hidden" onChange={(e)=>{ const f=e.target.files?.[0]; if(f) uploadMedia(f, 'audio'); e.target.value='' }} />
+              </label>
               <Input value={compose} onChange={setCompose} placeholder="Scrivi un messaggio" onKeyDown={(e) => { if (e.key === 'Enter') sendMessage() }} />
               <Button onClick={sendMessage}>Invia</Button>
             </div>
